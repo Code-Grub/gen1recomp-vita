@@ -1,0 +1,21 @@
+# Downloaded toolchains, SDK packages, mod releases and the ROM. Everything
+# here is fetched (and SHA-256 checked) by the build scripts, and some of it
+# must never be redistributed: the PowerVR driver modules are Sony/Imagination
+# blobs, and red.gb is a game dump.
+vendor/
+
+# Build output: VPKs, game.love, bytecode, screenshots, run logs.
+build/
+
+__pycache__/
+*.pyc
+
+# Never, under any circumstances.
+*.gb
+*.gbc
+*.sav
+*.vpk
+*.self
+*.velf
+*.love
+*.suprx
