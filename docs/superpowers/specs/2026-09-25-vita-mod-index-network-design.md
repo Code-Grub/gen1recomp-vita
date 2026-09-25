@@ -205,23 +205,90 @@ alternative reading remains open: that the handshake failed for a fixable local
 reason such as an undersized `sceSslInit` or `sceHttpInit` pool rather than
 cipher incompatibility. See "Next probe" below.
 
-## Next probe, before committing to a fallback
+## PROBE RESULT 2, 2026-09-25: HTTPS works. The blocker is GitHub-specific
 
-One more 37 KB trip, worth it because it decides whether an mbedtls integration
-is necessary or merely convenient:
+Raw report: `docs/superpowers/evidence/2026-09-25-g1r-net-probe-run2.txt`.
+This **partly reverses** the reading above, and it is better news.
 
-- disable each HTTPS flag **individually** and log which are accepted, then
-  retry with verification genuinely off. Closes caveat 1 by measurement.
-- vary the `sceSslInit` and `sceHttpInit` pool sizes upward. Rules out the
-  "undersized pool" reading of a `HANDSHAKE` failure.
-- request an endpoint that serves **older** TLS (for example
-  `tls-v1-0.badssl.com:1010` and `tls-v1-2.badssl.com:1012`). This is the
-  discriminator that matters: if an old-TLS endpoint handshakes and GitHub does
-  not, firmware `sceSsl` works and is simply too old for GitHub, which is
-  conclusive. If nothing handshakes at all, `sceHttps` is unusable here for a
-  different reason and that changes what the fallback must replace.
-- retry the plain-HTTP control against a different host, and after the HTTPS
-  attempts rather than before, closing caveat 2.
+**HTTPS on this console works, including TLS 1.2 and certificate validation:**
+
+| Endpoint | Result |
+| --- | --- |
+| `tls-v1-0.badssl.com:1010` | 200, 496 bytes |
+| `tls-v1-1.badssl.com:1011` | 200, 496 bytes |
+| `tls-v1-2.badssl.com:1012` | **200, 502 bytes** |
+| `badssl.com` (normal modern cert) | **200, 11673 bytes** |
+| `detectportal.firefox.com` (plain HTTP) | 200, 8 bytes |
+
+So `sceSsl` negotiates TLS 1.2 and validates a real certificate chain against
+the firmware CA store. "Firmware TLS is too old to do modern TLS" was wrong.
+
+**What stands from result 1:** GitHub still fails, identically, and not for a
+certificate reason. Both hosts, on small pools and on pools 7x and 20x larger,
+return `SCE_HTTP_ERROR_SSL` / `HTTPS_ERROR_HANDSHAKE` with an empty detail mask.
+So:
+
+- **pool size is ruled out** by measurement (phase 1 versus phase 2)
+- **shipping our own CA roots is still pointless.** It was aimed at a stale CA
+  store, and there is no certificate complaint to fix. Confirmed, not inferred.
+- the failure is specific to GitHub's TLS configuration, not to TLS in general
+
+**A hard constraint discovered, which removes an earlier decision.** Certificate
+verification **cannot be relaxed on this firmware**. Disabling is accepted for
+`CLIENT_VERIFY`, `NOT_AFTER_CHECK` and `NOT_BEFORE_CHECK`, and **rejected with
+`0x8043506B`** for `SERVER_VERIFY`, `CN_CHECK` and `KNOWN_CA_CHECK`. So the
+"HTTPS, cert verification relaxed" posture chosen at the start of this work is
+**not available on this hardware**: server verification stays on whether we want
+it or not. That is a good outcome for a pipeline that never digest-checks mod
+zips, and the entire security-posture section above is now moot rather than
+merely unnecessary.
+
+**Remaining question, and it decides the fallback.** GitHub Pages requires
+modern ECDHE key exchange and AEAD cipher suites and, being massively
+multi-tenant, requires SNI. badssl.com deliberately accepts old and weak
+configurations, so passing it does not prove much about either. The open
+question is whether this stack fails on GitHub specifically or on
+modern-cipher-only hosts generally, because the answer changes what is cheapest:
+
+- **fails only on GitHub-like hosts** -> a mirror on a host with a permissive
+  TLS configuration works, and no C is needed at all beyond the bridge. Note
+  `gen1recomp-mod-index` already carries an `oauth-worker`, so mirror
+  infrastructure may partly exist.
+- **fails on every modern-cipher host** -> the transport must bring its own TLS
+  (vdpm `curl` plus `mbedtls`), which is the largest option on the table.
+
+Unrelated but recorded: the resolver is partially broken on this network.
+`example.com` failed DNS twice (`RESOLVER_ENOHOST`) and `neverssl.com` timed
+out, while `detectportal.firefox.com` and every badssl host resolved. Not a
+blocker and not ours to fix, but do not use `example.com` as a control again.
+
+## Next probe (run 3): how narrow is the GitHub failure?
+
+Run 2 answered its three questions and replaced them with one. All of these are
+ordinary HTTPS GETs, so run 3 is the same 37 KB VPK with a different host list:
+
+- **modern mainstream hosts** that are not GitHub:
+  `https://www.cloudflare.com/`, `https://www.google.com/`,
+  `https://api.github.com/` and `https://objects.githubusercontent.com/`.
+  Cloudflare is the important one, because a Cloudflare-fronted mirror is the
+  cheapest fallback and this says directly whether it would work.
+- **cipher-specific badssl endpoints**, to name the missing capability rather
+  than guess it: `ecc256.badssl.com`, `ecc384.badssl.com`, `rsa2048.badssl.com`,
+  `rsa4096.badssl.com`, `sha384.badssl.com`, `sha512.badssl.com`,
+  `cbc.badssl.com`, `3des.badssl.com`. Which of these pass tells us whether the
+  gap is ECDHE curves, AEAD suites, or certificate signature algorithms.
+- **SNI**: `https://mismatch.badssl.com/` and an IP-literal request, to see
+  whether `sceHttp` sends SNI at all. GitHub Pages cannot serve a correct
+  certificate without it, so a missing SNI extension alone would explain the
+  whole result.
+
+Decision rule agreed in advance, so the result is not argued after the fact:
+
+| Outcome | Fallback |
+| --- | --- |
+| Cloudflare and Google pass | mirror the index behind a permissive host. No new TLS code. |
+| only old/weak badssl passes | transport must bring its own TLS (`curl` + `mbedtls`). |
+| SNI proven absent | same as above unless a mirror can be reached by a host that does not need it. |
 
 ## Security posture
 

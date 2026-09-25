@@ -1,0 +1,124 @@
+gen1recomp Vita network probe -- RUN 2
+======================================
+Closing run 1's loose ends: pool size, flag rejection, and the
+old-TLS discriminator. See native/net_probe.c for what each proves.
+
+console clock (UTC)  : 2026-09-25 04:56:47
+
+sysmodule NET        : 0x00000000
+sceNetInit           : 0x00000000
+sceNetCtlInit        : 0x00000000
+netctl state         : 0x00000000 state=3 (3 == CONNECTED)
+sysmodule HTTP       : 0x00000000
+sysmodule SSL        : 0x00000000
+sysmodule HTTPS      : 0x00000000
+
+=== PHASE 1: run 1's pool sizes (reproduce the baseline)
+sceSslInit(300 KB)     : 0x00000000 
+sceHttpInit(100 KB)    : 0x00000000 
+
+--- P1: GitHub Pages, small pools
+    https://bryanthaboi.github.io/gen1recomp-mod-index/data/index.json
+    sendRequest      : 0x80431075 SCE_HTTP_ERROR_SSL
+    sslError         : 0x80435061 HTTPS_ERROR_HANDSHAKE
+    sslDetail        : 0x00000000 none set (no certificate complaint at all)
+
+=== PHASE 2: same request, pools ~7x and ~20x larger
+    A different result here means run 1 was a pool problem, not TLS.
+sceHttpTerm / sceSslTerm : 0x00000000 / 0x00000000
+sceSslInit(2048 KB)    : 0x00000000 
+sceHttpInit(2048 KB)   : 0x00000000 
+
+--- P2: GitHub Pages, large pools
+    https://bryanthaboi.github.io/gen1recomp-mod-index/data/index.json
+    sendRequest      : 0x80431075 SCE_HTTP_ERROR_SSL
+    sslError         : 0x80435061 HTTPS_ERROR_HANDSHAKE
+    sslDetail        : 0x00000000 none set (no certificate complaint at all)
+
+--- P2: GitHub raw, large pools
+    https://raw.githubusercontent.com/bryanthaboi/gen1recomp-mod-index/main/site/data/index.json
+    sendRequest      : 0x80431075 SCE_HTTP_ERROR_SSL
+    sslError         : 0x80435061 HTTPS_ERROR_HANDSHAKE
+    sslDetail        : 0x00000000 none set (no certificate complaint at all)
+
+=== PHASE 3: verification genuinely off (run 1 could not do this)
+
+--- flag-by-flag sceHttpsDisableOption (run 1 rejected the combined mask)
+    SERVER_VERIFY    : 0x8043506B REJECTED
+    CLIENT_VERIFY    : 0x00000000 accepted
+    CN_CHECK         : 0x8043506B REJECTED
+    NOT_AFTER_CHECK  : 0x00000000 accepted
+    NOT_BEFORE_CHECK : 0x00000000 accepted
+    KNOWN_CA_CHECK   : 0x8043506B REJECTED
+
+--- P3: GitHub Pages, whatever disabling took
+    https://bryanthaboi.github.io/gen1recomp-mod-index/data/index.json
+    sendRequest      : 0x80431075 SCE_HTTP_ERROR_SSL
+    sslError         : 0x80435061 HTTPS_ERROR_HANDSHAKE
+    sslDetail        : 0x00000000 none set (no certificate complaint at all)
+
+=== PHASE 4: old-TLS endpoints -- the decisive comparison
+    Handshake here but not at GitHub => sceSsl works, is too old.
+    A CERT error counts as a handshake SUCCESS for this question.
+
+--- P4: TLS 1.0 endpoint
+    https://tls-v1-0.badssl.com:1010/
+    sendRequest      : 0x00000000 
+    statusCode       : 0x00000000 status=200
+    bytes read       : 496
+    SUCCESS
+
+--- P4: TLS 1.1 endpoint
+    https://tls-v1-1.badssl.com:1011/
+    sendRequest      : 0x00000000 
+    statusCode       : 0x00000000 status=200
+    bytes read       : 496
+    SUCCESS
+
+--- P4: TLS 1.2 endpoint
+    https://tls-v1-2.badssl.com:1012/
+    sendRequest      : 0x00000000 
+    statusCode       : 0x00000000 status=200
+    bytes read       : 502
+    SUCCESS
+
+--- P4: plain badssl root
+    https://badssl.com/
+    sendRequest      : 0x00000000 
+    statusCode       : 0x00000000 status=200
+    bytes read       : 11673
+    SUCCESS
+
+=== PHASE 5: plain-HTTP control, several hosts, after the TLS traffic
+    Run 1's single control failed with RESOLVER_ENOHOST while the
+    HTTPS hosts resolved fine, so this settles whether that was real.
+
+--- P5: Mozilla captive-portal check
+    http://detectportal.firefox.com/success.txt
+    sendRequest      : 0x00000000 
+    statusCode       : 0x00000000 status=200
+    bytes read       : 8
+    SUCCESS
+
+--- P5: neverssl
+    http://neverssl.com/
+    sendRequest      : 0x80431068 HTTP_ERROR_TIMEOUT
+    sslError         : 0x00000000 
+    sslDetail        : 0x00000000 none set (no certificate complaint at all)
+
+--- P5: example.com (run 1's host)
+    http://example.com/
+    sendRequest      : 0x80436007 RESOLVER_ENOHOST
+    sslError         : 0x00000000 
+    sslDetail        : 0x00000000 none set (no certificate complaint at all)
+
+======================================
+How to read this:
+  P2 succeeds where P1 failed   -> pool size was the bug. Plan revives.
+  P3 succeeds where P2 failed   -> cert validation only. Own roots work.
+  P4 handshakes, GitHub did not -> CONFIRMED: sceSsl too old for GitHub.
+                                   Fallback must bring its own TLS.
+  P4 fails everywhere too       -> sceHttps unusable here for another
+                                   reason; re-diagnose before choosing.
+  P5 all fail                   -> resolver really is broken; that is a
+                                   different bug and outranks the rest.
