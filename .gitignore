@@ -19,3 +19,9 @@ __pycache__/
 *.velf
 *.love
 *.suprx
+
+# native probe build artifacts (the .c is the source of record)
+native/*.elf
+native/*.velf
+native/*.velf.tmp
+native/*.self

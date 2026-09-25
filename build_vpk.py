@@ -53,12 +53,18 @@ DOWNLOADS = {
 }
 
 # What SDL_vitagles_pvr.c loads from app0:module (and libGL for gl4es).
+#
+# libpvr2d is NOT in SDL's explicit load list, but the window-system module
+# imports it, so leaving it out makes EGL init fail and LÖVE never gets a
+# window: on hardware the app died between love.conf and main.lua with no log
+# (2026-09-24). Ship every .suprx the driver release contains.
 MODULES = {
     "pvr_psp2.zip": [
         "libgpu_es4_ext.suprx",
         "libIMGEGL.suprx",
         "libGLESv1_CM.suprx",
         "libGLESv2.suprx",
+        "libpvr2d.suprx",
         "libpvrPSP2_WSEGL.suprx",
     ],
     "gl4es4vita.zip": ["libGL.suprx"],
@@ -220,10 +226,20 @@ def bytecode_chunks(engine, count=80):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine", default="C:/g2dev", help="Gen1Recomp engine checkout")
+    ap.add_argument("--eboot", default=None,
+                    help="LÖVE runtime to package (default: isage's prebuilt PowerVR eboot, "
+                         "which cannot create a GL context on real hardware; pass "
+                         "vendor/love-vita/love.self for the working vitaGL build)")
+    ap.add_argument("--extended-memory", action="store_true", help="param.sfo ATTRIBUTE2=12")
     args = ap.parse_args()
     engine = Path(args.engine)
 
-    eboot = fetch("eboot.bin")
+    eboot = Path(args.eboot) if args.eboot else fetch("eboot.bin")
+    if not eboot.is_file():
+        raise SystemExit(f"no such runtime: {eboot}")
+    global ATTRIBUTE2
+    if args.extended_memory:
+        ATTRIBUTE2 = 12
     module_zips = {name: fetch(name) for name in MODULES}
 
     shaders = extract_shaders(engine)

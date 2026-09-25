@@ -1,0 +1,4 @@
+# Patches must keep LF or "patch" and "git apply" reject them on checkout.
+*.patch -text
+# Shell scripts run under MSYS/bash.
+*.sh text eol=lf

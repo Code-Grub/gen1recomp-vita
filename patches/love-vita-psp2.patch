@@ -1,0 +1,839 @@
+diff --git a/src/love.cpp b/src/love.cpp
+index 79ab59c..f04e5b1 100644
+--- a/src/love.cpp
++++ b/src/love.cpp
+@@ -25,8 +25,254 @@
+ 
+ #ifdef LOVE_BUILD_EXE
+ 
+-int _newlib_heap_size_user   = 200 * 1024 * 1024;
+-unsigned int sceLibcHeapSize = 32 * 1024 * 1024;
++// A normal Vita app gets ~256 MB of user memory. Reserving 200 MB here (plus
++// 32 MB of libc heap) left EGL nothing to allocate a GL context from, and
++// eglCreateContext failed with EGL_BAD_ALLOC on every attempt, which surfaced
++// only as "Could not set window mode". The PowerVR driver needs its share.
++#ifndef LOVE_VITA_HEAP_MB
++#define LOVE_VITA_HEAP_MB 124
++#endif
++// Executable memory for LuaJIT, taken out of the heap's old budget so the
++// total reservation is unchanged. See g1r_jit_pool_reserve() below.
++#ifndef LOVE_VITA_JIT_POOL_MB
++#define LOVE_VITA_JIT_POOL_MB 4
++#endif
++int _newlib_heap_size_user   = LOVE_VITA_HEAP_MB * 1024 * 1024;
++unsigned int sceLibcHeapSize = 16 * 1024 * 1024;
++
++#ifdef __vita__
++#include <errno.h>
++#include <reent.h>
++#include <psp2/kernel/sysmem.h>
++#include <psp2/kernel/threadmgr.h>
++#include <psp2/kernel/processmgr.h>
++
++// LuaJIT's machine code has to sit within the reach of an ARM relative branch
++// (+-32 MB, of which LuaJIT uses half) of the interpreter, and it asks the OS
++// for memory at a chosen address to get there. The Vita cannot honour that:
++// sceKernelAllocMemBlockForVM() takes only a name and a size, and the kernel
++// places each block after everything already allocated. Since vitasdk's
++// _init_vita_heap() reserves the whole newlib heap as one block before main()
++// runs, every later block lands past it - measured at +139.6 MB with a 144 MB
++// heap and +26.7 MB with a 20 MB one, both out of range. Every trace then
++// failed with LJ_TRERR_MCODEAL while jit.status() still claimed to be on.
++//
++// The heap being one early block is also the way out: take the code pool
++// first and it lands a few MB from the code segment instead. So this replaces
++// libc's sbrk.o wholesale - all four symbols, or the linker would pull that
++// object back in for the ones we left out - and reserves the pool ahead of
++// the heap. lj_mcode.c carves its areas out of it, which also sidesteps the
++// kernel's refusal to grant VM blocks smaller than 1 MB.
++extern "C" {
++
++void *g1r_jit_pool_base = NULL;
++unsigned int g1r_jit_pool_size = 0;
++// Kept so lj_mcode_sync can flush the instruction cache against the right
++// block. It must not go looking the uid up from an address: the lookup it
++// used to do rounds down to a megabyte, which only ever matched back when
++// each mcode area was its own 1 MB-granular block.
++int g1r_jit_pool_uid = -1;
++int g1r_jit_pool_err = 0;
++static SceKernelLwMutexWork g1r_jit_pool_mutex;
++static int g1r_jit_pool_mutex_ok = 0;
++
++// Several Lua states carve areas out of the one pool - LOVE's audio workers
++// each run their own jit_State - so lj_mcode.c takes this around the free-page
++// bitmap. A LwMutex is the cheap kind and this is contended only while a trace
++// is being compiled.
++void g1r_jit_pool_lock(void)
++{
++	if (g1r_jit_pool_mutex_ok)
++		sceKernelLockLwMutex(&g1r_jit_pool_mutex, 1, 0);
++}
++
++void g1r_jit_pool_unlock(void)
++{
++	if (g1r_jit_pool_mutex_ok)
++		sceKernelUnlockLwMutex(&g1r_jit_pool_mutex, 1);
++}
++
++// --- JIT instrumentation --------------------------------------------------
++//
++// Reporting has to happen from C. Four attempts to write a file from Lua in
++// the running game produced nothing - not from io.open in conf.lua, which
++// provably executes, nor from love.filesystem in an epilogue appended to
++// main.lua. The standalone probes could do it; the game cannot. Every file
++// this port has successfully written (g1r-mem, g1r-gfx, g1r-sdl) was written
++// from here, so this is.
++//
++// What it is measuring: the stalls are irregular and multi-second, and the
++// suspicion is sceKernelSyncVMDomain, the instruction-cache flush after each
++// trace is written. Upstream gave every mcode area its own 1 MB block; ours
++// share one 4 MB block, so if the kernel's cost scales with the block rather
++// than the range, a burst of recompilation after LuaJIT discards its traces
++// would cost far more here than upstream ever paid. These counters say
++// whether that is true instead of leaving it a theory.
++static unsigned int      g1r_alloc_ok = 0;
++static unsigned int      g1r_alloc_fail = 0;
++
++
++void g1r_jit_note_alloc(int ok)
++{
++	if (ok) g1r_alloc_ok++; else g1r_alloc_fail++;
++}
++
++// --- frame timing ---------------------------------------------------------
++//
++// The stalls survive with no JIT tuning and no instrumentation, so they are
++// real and none of the earlier theories explain them. This records them
++// instead of guessing again, and it is built to not become the bug it is
++// measuring: the per-frame path is a clock read, a subtract and a compare,
++// with NO file I/O. A line is appended only when a frame has already taken
++// over a quarter of a second - at which point a few ms of fopen is noise
++// against the stall itself - and those are rare by definition.
++//
++// What each line answers: how long the freeze was, and whether the JIT was
++// busy across it. g1r_alloc_ok counts mcode areas handed out, so a jump in it
++// either side of a slow frame means LuaJIT threw its traces away and
++// recompiled - which would implicate the compiler. A slow frame with no
++// change in that number means the time went somewhere else entirely, and the
++// JIT is exonerated.
++#define G1R_SLOW_FRAME_US 250000
++
++static SceUInt64    g1r_frame_prev = 0;
++static unsigned int g1r_frame_no = 0;
++static unsigned int g1r_slow_seen = 0;
++static unsigned int g1r_alloc_at_last_slow = 0;
++
++void g1r_frame_tick(void)
++{
++	SceUInt64 now = sceKernelGetProcessTimeWide();
++	SceUInt64 prev = g1r_frame_prev;
++	g1r_frame_prev = now;
++	g1r_frame_no++;
++	if (prev == 0)
++		return;
++
++	SceUInt64 dt = now - prev;
++	if (dt < G1R_SLOW_FRAME_US)
++		return;
++
++	// Cap the file so a pathological run cannot fill the card.
++	if (++g1r_slow_seen > 200)
++		return;
++
++	FILE *f = fopen("ux0:data/g1r-frames.txt", "a");
++	if (!f)
++		return;
++	if (g1r_slow_seen == 1)
++		fprintf(f, "frame  at(s)  stall(ms)  mcodeAreas (+since last)  allocFail\n");
++	fprintf(f, "%6u %6.1f %9.0f %6u %+6d %10u\n",
++		g1r_frame_no, now / 1000000.0, dt / 1000.0,
++		g1r_alloc_ok, (int) g1r_alloc_ok - (int) g1r_alloc_at_last_slow,
++		g1r_alloc_fail);
++	g1r_alloc_at_last_slow = g1r_alloc_ok;
++	fclose(f);
++}
++
++
++static SceUID g1r_heap_memblock;
++static unsigned int g1r_heap_size;
++static char *g1r_heap_base, *g1r_heap_end, *g1r_heap_cur;
++static SceKernelLwMutexWork g1r_sbrk_mutex;
++
++static void g1r_jit_pool_reserve(void)
++{
++	SceUID uid = sceKernelAllocMemBlockForVM("LuaJIT mcode pool",
++		LOVE_VITA_JIT_POOL_MB * 1024 * 1024);
++	if (uid < 0)
++	{
++		g1r_jit_pool_err = uid;
++		return;
++	}
++	void *p = NULL;
++	int res = sceKernelGetMemBlockBase(uid, &p);
++	if (res < 0)
++	{
++		g1r_jit_pool_err = res;
++		sceKernelFreeMemBlock(uid);
++		return;
++	}
++	// Open the VM domain once and leave it open, so the pool is writable and
++	// executable for the whole run. LuaJIT would otherwise flip it around
++	// every trace, and sceKernelOpenVMDomain/CloseVMDomain act on the entire
++	// process: with LOVE's audio workers each compiling their own traces, the
++	// toggles interleave and one of them fails, which LuaJIT reports as
++	// "runtime code generation failed, restricted kernel?". lj_mcode.c builds
++	// with LUAJIT_UNPROTECT_MCODE so nothing toggles it again.
++	int opened = sceKernelOpenVMDomain();
++	if (opened < 0)
++	{
++		g1r_jit_pool_err = opened;
++		sceKernelFreeMemBlock(uid);
++		return;
++	}
++	g1r_jit_pool_mutex_ok =
++		sceKernelCreateLwMutex(&g1r_jit_pool_mutex, "jit pool", 0, 0, 0) >= 0;
++	g1r_jit_pool_uid = uid;
++	g1r_jit_pool_base = p;
++	g1r_jit_pool_size = LOVE_VITA_JIT_POOL_MB * 1024 * 1024;
++}
++
++void *_sbrk_r(struct _reent *reent, ptrdiff_t incr)
++{
++	if (sceKernelLockLwMutex(&g1r_sbrk_mutex, 1, 0) < 0)
++		goto fail;
++	if (!g1r_heap_base || g1r_heap_cur + incr >= g1r_heap_end)
++	{
++		sceKernelUnlockLwMutex(&g1r_sbrk_mutex, 1);
++fail:
++		reent->_errno = ENOMEM;
++		return (void *) -1;
++	}
++	{
++		char *prev = g1r_heap_cur;
++		g1r_heap_cur += incr;
++		sceKernelUnlockLwMutex(&g1r_sbrk_mutex, 1);
++		return (void *) prev;
++	}
++}
++
++void _init_vita_heap(void)
++{
++	if (sceKernelCreateLwMutex(&g1r_sbrk_mutex, "sbrk mutex", 0, 0, 0) < 0)
++		goto failure;
++
++	// Before the heap, while the only thing allocated is our own module.
++	g1r_jit_pool_reserve();
++
++	g1r_heap_size = (unsigned int) _newlib_heap_size_user;
++	g1r_heap_memblock = sceKernelAllocMemBlock("Newlib heap", 0x0c20d060,
++		g1r_heap_size, 0);
++	if (g1r_heap_memblock < 0)
++		goto failure;
++	if (sceKernelGetMemBlockBase(g1r_heap_memblock, (void **) &g1r_heap_base) < 0)
++		goto failure;
++	g1r_heap_end = g1r_heap_base + g1r_heap_size;
++	g1r_heap_cur = g1r_heap_base;
++	return;
++failure:
++	g1r_heap_memblock = 0;
++	g1r_heap_base = 0;
++	g1r_heap_cur = 0;
++}
++
++void _free_vita_heap(void)
++{
++	sceKernelDeleteLwMutex(&g1r_sbrk_mutex);
++	sceKernelFreeMemBlock(g1r_heap_memblock);
++	g1r_heap_memblock = 0;
++	g1r_heap_base = 0;
++	g1r_heap_cur = 0;
++}
++
++unsigned int _get_vita_heap_size(void)
++{
++	return g1r_heap_size;
++}
++
++}  // extern "C"
++#endif // __vita__
+ 
+ // Lua
+ extern "C" {
+@@ -129,6 +375,133 @@ static void get_app_arguments(int argc, char **argv, int &new_argc, char **&new_
+ 
+ #ifdef __vita__
+ 
++#include <vitaGL.h>
++#include <psp2/kernel/sysmem.h>
++#include <cstring>
++
++// SDL's vitaGL backend calls vglInitExtended but never sets up the runtime
++// GLSL compiler, so the first shader LOVE compiles reaches an uninitialised
++// vitaShaRK and takes the process down right after the GL context is created.
++// This must run before SDL brings the video subsystem up.
++static void vita_setup_shader_compiler()
++{
++	// Start each run with an empty graphics trace, so a stale file from an
++	// earlier build cannot be mistaken for this run's output.
++	FILE *f = fopen("ux0:data/g1r-gfx.txt", "w");
++	if (f)
++		fclose(f);
++
++	// LuaJIT gets its executable pages from sceKernelAllocMemBlockForVM, and
++	// on hardware every trace aborts with "failed to allocate mcode memory"
++	// no matter how small the request, which points at the app simply having
++	// no memory left. Report what is actually free, and try the same kind of
++	// allocation LuaJIT makes, so the cause is a measurement and not a guess.
++	FILE *m = fopen("ux0:data/g1r-mem.txt", "w");
++	if (m)
++	{
++		SceKernelFreeMemorySizeInfo info;
++		memset(&info, 0, sizeof(info));
++		info.size = sizeof(info);
++		int res = sceKernelGetFreeMemorySize(&info);
++		fprintf(m, "sceKernelGetFreeMemorySize -> 0x%08X\n", res);
++		fprintf(m, "free LPDDR2 (main)  %d bytes (%.1f MB)\n",
++			info.size_user, info.size_user / 1048576.0);
++		fprintf(m, "free CDRAM          %d bytes (%.1f MB)\n",
++			info.size_cdram, info.size_cdram / 1048576.0);
++		fprintf(m, "free phycont        %d bytes (%.1f MB)\n",
++			info.size_phycont, info.size_phycont / 1048576.0);
++		fprintf(m, "newlib heap reserved %d MB, libc heap 16 MB\n", LOVE_VITA_HEAP_MB);
++
++		// Whether the pool reserved ahead of the heap actually landed inside
++		// the branch range LuaJIT needs. This is the whole test: if the delta
++		// is under 14 MB, traces can compile.
++		uintptr_t code = (uintptr_t) (void *) &vita_setup_shader_compiler;
++		fprintf(m, "code address        0x%08X\n", (unsigned) code);
++		if (g1r_jit_pool_base)
++		{
++			intptr_t delta = (intptr_t) ((uintptr_t) g1r_jit_pool_base - code);
++			fprintf(m, "jit pool            0x%08X  %d MB  delta %+.1f MB  %s\n",
++				(unsigned) (uintptr_t) g1r_jit_pool_base,
++				LOVE_VITA_JIT_POOL_MB, delta / 1048576.0,
++				(delta > -14 * 1048576 && delta < 14 * 1048576) ? "IN RANGE" : "OUT OF RANGE");
++		}
++		else
++		{
++			fprintf(m, "jit pool            NOT RESERVED (0x%08X)\n",
++				(unsigned) g1r_jit_pool_err);
++		}
++
++		// Why trace assembly is ~28 KB/s here (measured: ~128 KB of machine
++		// code per 4.5 s stall, and it is NOT flush storms - the area count
++		// never reaches the ceiling). Two candidates, both settled below, once,
++		// at startup, before Lua exists. Nothing here runs per frame.
++		//
++		//  1. The pool may be uncached. sceKernelAllocMemBlockForVM exists for
++		//     runtime code generation, and the kernel may map it non-cached so
++		//     the instruction side stays coherent. LuaJIT's assembler emits a
++		//     trace backwards with many small writes and then patches it, so
++		//     uncached would cost roughly two orders of magnitude - which is
++		//     the size of the gap. Compared against ordinary heap memory.
++		//  2. LuaJIT's own allocator is switched off on this target
++		//     (lj_arch.h forces LUAJIT_USE_SYSMALLOC for PSP2 and lj_alloc.c
++		//     has no PSP2 backend), so every compiler allocation goes through
++		//     newlib malloc, under a lock the audio workers also take.
++		enum { BENCH_BYTES = 512 * 1024, BENCH_ALLOCS = 20000 };
++		void *heapbuf = malloc(BENCH_BYTES);
++		if (heapbuf && g1r_jit_pool_base)
++		{
++			// Touch both first so neither pays a one-off mapping cost.
++			memset(heapbuf, 0, BENCH_BYTES);
++			memset(g1r_jit_pool_base, 0, BENCH_BYTES);
++
++			// 32-bit stores, which is what an instruction stream is.
++			volatile uint32_t *hp = (volatile uint32_t *) heapbuf;
++			volatile uint32_t *pp = (volatile uint32_t *) g1r_jit_pool_base;
++			const int words = BENCH_BYTES / 4;
++
++			SceUInt64 t0 = sceKernelGetProcessTimeWide();
++			for (int i = 0; i < words; i++) hp[i] = (uint32_t) i;
++			SceUInt64 theap = sceKernelGetProcessTimeWide() - t0;
++
++			t0 = sceKernelGetProcessTimeWide();
++			for (int i = 0; i < words; i++) pp[i] = (uint32_t) i;
++			SceUInt64 tpool = sceKernelGetProcessTimeWide() - t0;
++
++			fprintf(m, "\nwrite 512 KB to heap    %6llu us (%.1f MB/s)\n",
++				theap, theap ? 0.5 / (theap / 1000000.0) : 0.0);
++			fprintf(m, "write 512 KB to jitpool %6llu us (%.1f MB/s)  %.1fx %s\n",
++				tpool, tpool ? 0.5 / (tpool / 1000000.0) : 0.0,
++				theap ? (double) tpool / theap : 0.0,
++				tpool > theap * 4 ? "<-- POOL IS SLOW (uncached?)" : "comparable");
++		}
++		if (heapbuf)
++			free(heapbuf);
++
++		// newlib malloc throughput, the other candidate.
++		{
++			void **keep = (void **) malloc(sizeof(void *) * 256);
++			if (keep)
++			{
++				SceUInt64 t0 = sceKernelGetProcessTimeWide();
++				for (int i = 0; i < BENCH_ALLOCS; i++)
++				{
++					int slot = i & 255;
++					if (keep[slot] && i >= 256) free(keep[slot]);
++					keep[slot] = malloc(48 + (i & 127));
++				}
++				SceUInt64 tm = sceKernelGetProcessTimeWide() - t0;
++				for (int i = 0; i < 256; i++) free(keep[i]);
++				free(keep);
++				fprintf(m, "%d malloc/free pairs  %6llu us (%.2f us each)\n",
++					(int) BENCH_ALLOCS, tm, (double) tm / BENCH_ALLOCS);
++			}
++		}
++		fclose(m);
++	}
++
++	vglSetupRuntimeShaderCompiler(SHARK_OPT_DEFAULT, SHARK_ENABLE, SHARK_ENABLE, SHARK_ENABLE);
++}
++
+ #include <vector>
+ 
+ static void set_app_arguments(int argc, char **argv, int &new_argc, char **&new_argv)
+@@ -213,6 +586,7 @@ static DoneAction runlove(int argc, char **argv, int &retval)
+ #ifdef __vita__
+ 	int hack_argc = 0;
+ 	char **hack_argv = nullptr;
++	vita_setup_shader_compiler();
+ 	set_app_arguments(argc, argv, hack_argc, hack_argv);
+ 	argc = hack_argc;
+ 	argv = hack_argv;
+diff --git a/src/modules/graphics/opengl/OpenGL.cpp b/src/modules/graphics/opengl/OpenGL.cpp
+index 7c7118b..dcaa0e1 100644
+--- a/src/modules/graphics/opengl/OpenGL.cpp
++++ b/src/modules/graphics/opengl/OpenGL.cpp
+@@ -195,12 +195,33 @@ bool OpenGL::initContext()
+ 	return true;
+ }
+ 
++
++#ifdef __vita__
++#include <cstdio>
++#include <cstdarg>
++static void g1r_gl(const char *fmt, ...)
++{
++	FILE *f = fopen("ux0:data/g1r-gfx.txt", "a");
++	if (!f) return;
++	va_list ap;
++	va_start(ap, fmt);
++	vfprintf(f, fmt, ap);
++	va_end(ap);
++	fputs("\n", f);
++	fclose(f);
++}
++#else
++static void g1r_gl(const char *, ...) {}
++#endif
++
+ void OpenGL::setupContext()
+ {
+ 	if (!contextInitialized)
+ 		return;
+ 
++	g1r_gl("  setupContext: initMaxValues");
+ 	initMaxValues();
++	g1r_gl("  initMaxValues ok: maxTextureUnits=%d max2DTextureSize=%d maxRenderTargets=%d", maxTextureUnits, max2DTextureSize, maxRenderTargets);
+ 
+ 	GLfloat glcolor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+ 	glVertexAttrib4fv(ATTRIB_COLOR, glcolor);
+@@ -208,6 +229,7 @@ void OpenGL::setupContext()
+ 
+ 	GLint maxvertexattribs = 1;
+ 	glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &maxvertexattribs);
++	g1r_gl("  maxvertexattribs=%d", (int) maxvertexattribs);
+ 
+ 	state.enabledAttribArrays = (uint32) ((1ull << uint32(maxvertexattribs)) - 1);
+ 	state.instancedAttribArrays = 0;
+@@ -255,12 +277,14 @@ void OpenGL::setupContext()
+ 	}
+ 
+ 	// Initialize multiple texture unit support for shaders.
++	g1r_gl("  resizing boundTextures for %d units", maxTextureUnits);
+ 	for (int i = 0; i < TEXTURE_MAX_ENUM; i++)
+ 	{
+ 		state.boundTextures[i].clear();
+ 		state.boundTextures[i].resize(maxTextureUnits, 0);
+ 	}
+ 
++	g1r_gl("  binding default textures");
+ 	for (int i = 0; i < maxTextureUnits; i++)
+ 	{
+ 		glActiveTexture(GL_TEXTURE0 + i);
+@@ -460,6 +484,19 @@ void OpenGL::initOpenGLFunctions()
+ 
+ void OpenGL::initMaxValues()
+ {
++	// vitaGL reports itself as ES 2.0 but does not implement
++	// glGetShaderPrecisionFormat at all, so GLAD leaves the pointer null and
++	// calling it kills the process here, before anything is drawn. The SGX543
++	// does support high precision in fragment shaders
++	// (GL_OES_fragment_precision_high), so assume it when the query is absent.
++#ifdef __vita__
++	// vitaGL reports ES 2.0 but has no glGetShaderPrecisionFormat, and SDL's
++	// vitaGL backend still returns a non-null address for it, so a null check
++	// is not enough: calling it kills the process before anything is drawn.
++	// The SGX543 supports high precision in fragment shaders
++	// (GL_OES_fragment_precision_high), so take that as given and never ask.
++	pixelShaderHighpSupported = true;
++#else
+ 	if (GLAD_ES_VERSION_2_0 && !GLAD_ES_VERSION_3_0)
+ 	{
+ 		GLint range = 0;
+@@ -469,19 +506,24 @@ void OpenGL::initMaxValues()
+ 	}
+ 	else
+ 		pixelShaderHighpSupported = true;
++#endif
+ 
++	g1r_gl("   A precision block done");
+ 	baseVertexSupported = GLAD_VERSION_3_2 || GLAD_ES_VERSION_3_2 || GLAD_ARB_draw_elements_base_vertex
+ 		|| GLAD_OES_draw_elements_base_vertex || GLAD_EXT_draw_elements_base_vertex;
+ 
+ 	// We'll need this value to clamp anisotropy.
++	g1r_gl("   B anisotropic?");
+ 	if (GLAD_EXT_texture_filter_anisotropic)
+ 		glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maxAnisotropy);
+ 	else
+ 		maxAnisotropy = 1.0f;
+ 
++	g1r_gl("   C max texture size");
+ 	glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max2DTextureSize);
+ 	glGetIntegerv(GL_MAX_CUBE_MAP_TEXTURE_SIZE, &maxCubeTextureSize);
+ 
++	g1r_gl("   D volume texture check");
+ 	if (isTextureTypeSupported(TEXTURE_VOLUME))
+ 		glGetIntegerv(GL_MAX_3D_TEXTURE_SIZE, &max3DTextureSize);
+ 	else
+@@ -492,6 +534,7 @@ void OpenGL::initMaxValues()
+ 	else
+ 		maxTextureArrayLayers = 0;
+ 
++	g1r_gl("   E attachments");
+ 	int maxattachments = 1;
+ 	int maxdrawbuffers = 1;
+ 
+@@ -501,6 +544,7 @@ void OpenGL::initMaxValues()
+ 		glGetIntegerv(GL_MAX_DRAW_BUFFERS, &maxdrawbuffers);
+ 	}
+ 
++	g1r_gl("   F render targets");
+ 	maxRenderTargets = std::max(std::min(maxattachments, maxdrawbuffers), 1);
+ 
+ 	if (GLAD_ES_VERSION_3_0 || GLAD_VERSION_3_0 || GLAD_ARB_framebuffer_object
+@@ -512,8 +556,11 @@ void OpenGL::initMaxValues()
+ 	else
+ 		maxRenderbufferSamples = 0;
+ 
++	g1r_gl("   G combined texture units");
+ 	glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &maxTextureUnits);
++	g1r_gl("   G done: units=%d", maxTextureUnits);
+ 
++	g1r_gl("   H point size range");
+ 	GLfloat limits[2];
+ 	if (GLAD_VERSION_3_0)
+ 		glGetFloatv(GL_POINT_SIZE_RANGE, limits);
+@@ -521,10 +568,12 @@ void OpenGL::initMaxValues()
+ 		glGetFloatv(GL_ALIASED_POINT_SIZE_RANGE, limits);
+ 	maxPointSize = limits[1];
+ 
++	g1r_gl("   I lod bias");
+ 	if (isSamplerLODBiasSupported())
+ 		glGetFloatv(GL_MAX_TEXTURE_LOD_BIAS, &maxLODBias);
+ 	else
+ 		maxLODBias = 0.0f;
++	g1r_gl("   J initMaxValues complete");
+ }
+ 
+ void OpenGL::createDefaultTexture()
+diff --git a/src/modules/graphics/opengl/Shader.cpp b/src/modules/graphics/opengl/Shader.cpp
+index 8aff645..c57be81 100644
+--- a/src/modules/graphics/opengl/Shader.cpp
++++ b/src/modules/graphics/opengl/Shader.cpp
+@@ -73,6 +73,25 @@ Shader::~Shader()
+ 	}
+ }
+ 
++#ifdef __vita__
++#include <cstdio>
++#include <cstdarg>
++// Trace program linking on hardware: both shader stages compile, then the
++// process dies before main.lua ever loads.
++static void g1r_pr(const char *fmt, ...)
++{
++	FILE *f = fopen("ux0:data/g1r-gfx.txt", "a");
++	if (!f) return;
++	va_list ap;
++	va_start(ap, fmt);
++	vfprintf(f, fmt, ap);
++	va_end(ap);
++	fputc(0x0A, f);
++	fclose(f);
++}
++#else
++static void g1r_pr(const char *, ...) {}
++#endif
+ void Shader::mapActiveUniforms()
+ {
+ 	// Built-in uniform locations default to -1 (nonexistent.)
+@@ -89,6 +108,7 @@ void Shader::mapActiveUniforms()
+ 
+ 	GLint numuniforms;
+ 	glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &numuniforms);
++	g1r_pr("     uniforms: count=%d", (int) numuniforms);
+ 
+ 	GLchar cname[256];
+ 	const GLint bufsize = (GLint) (sizeof(cname) / sizeof(GLchar));
+@@ -102,7 +122,10 @@ void Shader::mapActiveUniforms()
+ 		GLenum gltype = 0;
+ 		UniformInfo u = {};
+ 
++		g1r_pr("     uniforms: get %d", (int) uindex);
+ 		glGetActiveUniform(program, (GLuint) uindex, bufsize, &namelen, &u.count, &gltype, cname);
++		g1r_pr("     uniforms: got namelen=%d type=0x%x count=%d name=%.64s",
++			(int) namelen, (unsigned) gltype, (int) u.count, namelen > 0 ? cname : "(empty)");
+ 
+ 		u.name = std::string(cname, (size_t) namelen);
+ 		u.location = glGetUniformLocation(program, u.name.c_str());
+@@ -204,6 +227,12 @@ void Shader::mapActiveUniforms()
+ 
+ 			size_t offset = 0;
+ 
++			// vitaGL implements neither glGetUniformfv nor glGetUniformiv, and
++			// a missing function still resolves to a non-null address here, so
++			// reading initial values crashes the process. The data was just
++			// zeroed, which is the right answer anyway: GLSL ES 1.00 does not
++			// allow uniform initializers, so there is nothing to read back.
++#ifndef __vita__
+ 			// Store any shader-initialized values in our own memory.
+ 			for (int i = 0; i < u.count; i++)
+ 			{
+@@ -244,6 +273,7 @@ void Shader::mapActiveUniforms()
+ 					break;
+ 				}
+ 			}
++#endif // __vita__
+ 		}
+ 
+ 		uniforms[u.name] = u;
+@@ -318,7 +348,9 @@ bool Shader::loadVolatile()
+ 			stage->loadVolatile();
+ 	}
+ 
++	g1r_pr("     prog: glCreateProgram");
+ 	program = glCreateProgram();
++	g1r_pr("     prog: id=%u", (unsigned) program);
+ 
+ 	if (program == 0)
+ 		throw love::Exception("Cannot create shader program object.");
+@@ -337,10 +369,13 @@ bool Shader::loadVolatile()
+ 			glBindAttribLocation(program, i, (const GLchar *) name);
+ 	}
+ 
++	g1r_pr("     prog: glLinkProgram");
+ 	glLinkProgram(program);
++	g1r_pr("     prog: linked");
+ 
+ 	GLint status;
+ 	glGetProgramiv(program, GL_LINK_STATUS, &status);
++	g1r_pr("     prog: link status=%d", (int) status);
+ 
+ 	if (status == GL_FALSE)
+ 	{
+@@ -351,7 +386,9 @@ bool Shader::loadVolatile()
+ 	}
+ 
+ 	// Get all active uniform variables in this shader from OpenGL.
++	g1r_pr("     prog: mapActiveUniforms");
+ 	mapActiveUniforms();
++	g1r_pr("     prog: uniforms mapped");
+ 
+ 	for (int i = 0; i < int(ATTRIB_MAX_ENUM); i++)
+ 	{
+@@ -367,7 +404,9 @@ bool Shader::loadVolatile()
+ 		// make sure glUseProgram gets called.
+ 		current = nullptr;
+ 		attach();
++		g1r_pr("     prog: updateBuiltinUniforms");
+ 		updateBuiltinUniforms();
++		g1r_pr("     prog: builtins updated");
+ 	}
+ 
+ 	return true;
+diff --git a/src/modules/thread/LuaThread.cpp b/src/modules/thread/LuaThread.cpp
+index d052d31..be837f0 100644
+--- a/src/modules/thread/LuaThread.cpp
++++ b/src/modules/thread/LuaThread.cpp
+@@ -53,6 +53,36 @@ void LuaThread::threadFunction()
+ 	lua_State *L = luaL_newstate();
+ 	luaL_openlibs(L);
+ 
++#ifdef __vita__
++	// Only one Lua state may run the JIT compiler on this console.
++	//
++	// Measured, by elimination, with vita-probe/build_jitmt.py: a single state
++	// compiling repeatedly is fine (12 flush-and-recompile rounds); three more
++	// states running INTERPRETED alongside it is fine; the moment those states
++	// compile as well, the process dies. What they share is the one mcode
++	// region and the VM domain it lives in, and sceKernelSyncVMDomain - the
++	// instruction-cache flush after writing a trace - acts on a whole memory
++	// block. Upstream got isolation for free by giving every mcode area its own
++	// block; ours all come out of one pool, so one state's flush lands on
++	// memory another state is executing from.
++	//
++	// Turning the JIT off here, rather than letting the allocator refuse, is
++	// deliberate: a state that keeps *trying* to compile and failing is far
++	// slower than one that never tries (3340 ms against 657 ms on the loop this
++	// was measured with). Worker states therefore run interpreted, exactly as
++	// they did before any of this worked, and the main state keeps the JIT.
++	lua_getglobal(L, "jit");
++	if (lua_istable(L, -1))
++	{
++		lua_getfield(L, -1, "off");
++		if (lua_isfunction(L, -1))
++			lua_call(L, 0, 0);
++		else
++			lua_pop(L, 1);
++	}
++	lua_pop(L, 1);
++#endif
++
+ #ifdef LOVE_BUILD_STANDALONE
+ 	luax_preload(L, luaopen_love, "love");
+ 	luax_require(L, "love");
+diff --git a/src/modules/window/sdl/Window.cpp b/src/modules/window/sdl/Window.cpp
+index 605b3c1..107fd0d 100644
+--- a/src/modules/window/sdl/Window.cpp
++++ b/src/modules/window/sdl/Window.cpp
+@@ -251,6 +251,19 @@ std::vector<Window::ContextAttribs> Window::getContextAttribsList() const
+ 
+ 	std::vector<ContextAttribs> glescontexts = {{2, 0, true, debug}};
+ 
++#ifdef __vita__
++	// This build links SDL2 with the vitaGL backend (GXM directly), not the
++	// PowerVR/EGL one: on real hardware eglCreateContext failed with
++	// EGL_BAD_ALLOC for every configuration, even from a 40-line C program,
++	// so that path is unusable here.
++	//
++	// vitaGL creates the context happily but reports itself as
++	// "OpenGL ES 2.0 VitaGL - SGX543MP4+", so it must be requested as GLES:
++	// asking for desktop GL 2.1 got a working context thrown away by
++	// checkGLVersion, which read that string and saw an ES driver.
++	return std::vector<ContextAttribs>{{2, 0, true, debug}};
++#endif
++
+ 	// While UWP SDL is above 2.0.4, it still doesn't support OpenGL ES 3+
+ #ifndef LOVE_WINDOWS_UWP
+ 	// OpenGL ES 3+ contexts are only properly supported in SDL 2.0.4+.
+@@ -303,22 +316,46 @@ bool Window::createWindowAndContext(int x, int y, int w, int h, Uint32 windowfla
+ 			window = nullptr;
+ 		}
+ 
++#ifdef __vita__
++		// The Vita has nowhere to show a message and SDL's own log file stays
++		// empty here, so record why each attempt failed. Without this the only
++		// symptom is love.window.setMode returning false.
++		auto vitalog = [&](const char *what, const char *detail)
++		{
++			FILE *vf = fopen("ux0:data/g1r-sdl.txt", "a");
++			if (vf)
++			{
++				fprintf(vf, "%s %d.%d flags 0x%x: %s: %s\n", attribs.gles ? "ES" : "GL",
++					attribs.versionMajor, attribs.versionMinor, (unsigned) windowflags,
++					what, detail ? detail : "(no detail)");
++				fclose(vf);
++			}
++		};
++#else
++		auto vitalog = [](const char *, const char *) {};
++#endif
++
+ 		window = SDL_CreateWindow(title.c_str(), x, y, w, h, windowflags);
+ 
+ 		if (!window)
+ 		{
+ 			windowerror = std::string(SDL_GetError());
++			vitalog("SDL_CreateWindow failed", windowerror.c_str());
+ 			return false;
+ 		}
++		vitalog("SDL_CreateWindow ok", nullptr);
+ 
+ 		context = SDL_GL_CreateContext(window);
+ 
+ 		if (!context)
+ 			contexterror = std::string(SDL_GetError());
++		vitalog(context ? "SDL_GL_CreateContext ok" : "SDL_GL_CreateContext failed",
++			context ? nullptr : contexterror.c_str());
+ 
+ 		// Make sure the context's version is at least what we requested.
+ 		if (context && !checkGLVersion(attribs, glversion))
+ 		{
++			vitalog("context version check failed, got", glversion.c_str());
+ 			SDL_GL_DeleteContext(context);
+ 			context = nullptr;
+ 		}
+@@ -330,6 +367,43 @@ bool Window::createWindowAndContext(int x, int y, int w, int h, Uint32 windowfla
+ 			return false;
+ 		}
+ 
++#ifdef __vita__
++		// What the window and the drawable actually are, straight from SDL.
++		// The game is cropped on this panel while the same code at the same
++		// size is pixel-correct on desktop, so the question is whether SDL
++		// and the GL drawable agree with the 960x544 LOVE reports. Written
++		// here because reporting from Lua does not work in the running game:
++		// four attempts produced no file at all, including io.open from
++		// conf.lua, which demonstrably executes.
++		{
++			FILE *g = fopen("ux0:data/g1r-screen.txt", "w");
++			if (g)
++			{
++				int ww = 0, wh = 0, dw = 0, dh = 0;
++				SDL_GetWindowSize(window, &ww, &wh);
++				SDL_GL_GetDrawableSize(window, &dw, &dh);
++				fprintf(g, "SDL_GetWindowSize       %d x %d\n", ww, wh);
++				fprintf(g, "SDL_GL_GetDrawableSize  %d x %d\n", dw, dh);
++
++				SDL_DisplayMode mode;
++				if (SDL_GetWindowDisplayMode(window, &mode) == 0)
++					fprintf(g, "windowDisplayMode       %d x %d @%dHz\n",
++						mode.w, mode.h, mode.refresh_rate);
++				if (SDL_GetCurrentDisplayMode(0, &mode) == 0)
++					fprintf(g, "currentDisplayMode      %d x %d @%dHz\n",
++						mode.w, mode.h, mode.refresh_rate);
++				if (SDL_GetDesktopDisplayMode(0, &mode) == 0)
++					fprintf(g, "desktopDisplayMode      %d x %d @%dHz\n",
++						mode.w, mode.h, mode.refresh_rate);
++
++				fprintf(g, "windowFlags             0x%08X\n",
++					(unsigned) SDL_GetWindowFlags(window));
++
++				fclose(g);
++			}
++		}
++#endif
++
+ 		return true;
+ 	};
+ 
+@@ -1015,8 +1089,18 @@ bool Window::isMinimized() const
+ 	return window != nullptr && (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED);
+ }
+ 
++#ifdef __vita__
++extern "C" void g1r_frame_tick(void);
++#endif
++
+ void Window::swapBuffers()
+ {
++#ifdef __vita__
++	// One call per presented frame. See love.cpp: it is two adds and a compare
++	// in the normal case, and only touches the card on a frame that already
++	// took a quarter of a second, which is the thing being recorded.
++	g1r_frame_tick();
++#endif
+ #ifdef LOVE_WINDOWS
+ 	bool useDwmFlush = false;
+ 	int swapInterval = getVSync();
