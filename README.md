@@ -6,9 +6,19 @@ Runs the Gen1Recomp engine on isage's LÖVE 11.4 Vita port
 ## Build
 
 ```
-python build_game_vpk.py --engine C:/g2dev     # the game  -> build/gen1recomp-vita.vpk
+python build_game_vpk.py --engine C:/g2dev --eboot vendor/love-vita/love.self
 python build_vpk.py --engine C:/g2dev          # the probe -> build/gen1recomp-vita-probe.vpk
 ```
+
+`--eboot` is not optional for a build meant to run: the default is isage's
+prebuilt eboot (LuaJIT 2.0.5), while everything `vita/conf.lua` relies on --
+the executable mcode pool, the enum-width fix, `POKEPORT_VITA_JIT` -- lives in
+the runtime built here. See "Building a LuaJIT 2.1 runtime" below.
+
+`INCLUDE` in `build_game_vpk.py` is a hand-copy of the file set in the
+engine's `scripts/pack_love.sh`, and `check_release_set()` compares the two on
+every build. If it stops the build, the engine added a file: add it to
+`INCLUDE`, and to `REQUIRED` if `pack_love.sh` asserts it.
 
 The eboot and the GPU driver modules are downloaded into `vendor/` and checked
 against pinned SHA-256s. `game.love` contains the desktop release's file set
@@ -32,8 +42,15 @@ either. The audio synth and startup parsing are the two real CPU costs.
 - `\u{XXXX}` string escapes are 2.1-only. The build rewrites them to the same
   UTF-8 bytes (`build/lua20/`); today that is one line in
   `src/ui/gen2/BattleState.lua`, which otherwise fails to load on the Vita
-  and takes every Gen 2 battle down with it. (Fixed upstream in this
-  checkout by commit 5732d36c; the rewrite still covers older engines.)
+  and takes every Gen 2 battle down with it.
+- **`goto` is 2.1-only too, and nothing rewrites it.** As of engine v0.3.14
+  the Gen 3 importer uses it (`src/import/gba/map_tree.lua`,
+  `door_anim_extract.lua`, `extract_map_events.lua`, `extract_scripts.lua`,
+  `battle_anim_extract.lua`). Those modules are only `require`d while
+  importing a GBA ROM, so Gen 1 and Gen 2 are unaffected, but on isage's
+  2.0.5 eboot a FireRed/LeafGreen import fails at parse time. The runtime
+  this port actually ships (`vendor/love-vita/love.self`, LuaJIT 2.1) has
+  no such limit -- this only bites a build made with the default `--eboot`.
 - `--bytecode` ships precompiled chunks instead of source, which skips
   parsing ~11 MB at startup (141 ms -> 14 ms on a desktop, tens of times
   more on the Vita's CPU). **Off by default**: loading bytecode while the

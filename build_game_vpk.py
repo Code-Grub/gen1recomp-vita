@@ -32,18 +32,32 @@ TITLE_ID = "GENR00001"
 TITLE = "Gen1Recomp"
 STITLE = "Gen1Recomp"
 
-# scripts/pack_love.sh, kept in step by hand
+# scripts/pack_love.sh, kept in step by hand -- and checked against it at build
+# time by check_release_set(), because the hand-keeping failed once: the engine
+# added tools/rom_manifest_firered.json and tools/rom_manifest_leafgreen.json
+# and this list did not, so the VPK would have shipped without them.
 INCLUDE = [
     "main.lua", "conf.lua", "src", "data", "assets", "tools/save-editor",
     "tools/rom_manifest.json", "tools/rom_manifest_blue.json",
     "tools/rom_manifest_yellow.json", "tools/rom_manifest_gold.json",
     "tools/rom_manifest_silver.json", "tools/rom_manifest_crystal.json",
+    "tools/rom_manifest_firered.json", "tools/rom_manifest_leafgreen.json",
     "PATCH_NOTES.md",
+    # Patch notes for the in-game updater, which reads it from the package
+    # (src/update/PatchNotes.lua); pack_love.sh adds it when it exists.
+    "mobile/ios/app-repo.json",
 ]
 EXCLUDE_PREFIXES = ("data/generated/", "assets/generated/")
+# pack_love.sh's own post-pack assertions, plus conf_engine.lua, which only
+# this build produces.
 REQUIRED = [
     "main.lua", "conf_engine.lua", "src/import/LauncherView.lua", "src/ui/kit/Kit.lua",
-    "tools/save-editor/App.lua", "tools/rom_manifest.json",
+    "tools/save-editor/App.lua", "tools/save-editor/Kit.lua",
+    "tools/save-editor/PadInput.lua", "tools/save-editor/panels/Party.lua",
+    "tools/rom_manifest.json", "tools/rom_manifest_blue.json",
+    "tools/rom_manifest_yellow.json", "tools/rom_manifest_gold.json",
+    "tools/rom_manifest_silver.json", "tools/rom_manifest_crystal.json",
+    "tools/rom_manifest_firered.json", "tools/rom_manifest_leafgreen.json",
 ]
 ROM_SUFFIXES = (".gb", ".gbc", ".sav")
 
@@ -77,6 +91,39 @@ def engine_files(engine):
                 print(f"rewrote \\u{{}} escapes for LuaJIT 2.0: {rel}")
                 f = out
         yield f, rel
+
+
+PACK_SCRIPT = "scripts/pack_love.sh"
+
+
+def check_release_set(engine):
+    """Fail if scripts/pack_love.sh packs something INCLUDE does not.
+
+    The desktop release's file set lives in that script and INCLUDE is a
+    hand-copy of it, so the two drift silently: the engine adds a file, this
+    build keeps working, and the VPK ships without it.  Only paths the
+    checkout actually has count, which skips CI-only names like
+    build-info.json that the script zips from elsewhere.
+    """
+    script = engine / PACK_SCRIPT
+    if not script.is_file():
+        print(f"warning: no {PACK_SCRIPT}; release file set unchecked")
+        return
+    # Line continuations first: the main zip spans six lines.
+    text = script.read_text(encoding="utf-8").replace("\\\n", " ")
+    packed = []
+    main = re.search(r'zip\s+-q\s+-9\s+-r\s+"\$OUTPUT"(.*?)\s-x\s', text)
+    if main:
+        packed += main.group(1).split()
+    packed += [t.rstrip(")") for t in re.findall(r'zip\s+-q\s+"\$OUTPUT"\s+(\S+)', text)]
+    unpacked = sorted({p for p in packed if p not in INCLUDE and (engine / p).exists()})
+    if unpacked:
+        raise SystemExit(
+            f"{PACK_SCRIPT} packs files INCLUDE does not: {', '.join(unpacked)}\n"
+            "Add them to INCLUDE, and to REQUIRED if pack_love.sh asserts them.")
+    stale = [p for p in INCLUDE if p not in packed]
+    if stale:
+        print(f"warning: INCLUDE has entries {PACK_SCRIPT} no longer packs: {', '.join(stale)}")
 
 
 def _release_files(engine):
@@ -163,6 +210,7 @@ def main():
                          "probe's bytecode test on real hardware before trusting it")
     args = ap.parse_args()
     engine = Path(args.engine)
+    check_release_set(engine)
 
     eboot = Path(args.eboot) if args.eboot else base.fetch("eboot.bin")
     if not eboot.is_file():
