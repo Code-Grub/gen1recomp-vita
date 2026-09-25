@@ -1,0 +1,58 @@
+gen1recomp Vita network probe
+=============================
+
+console clock (UTC)  : 2026-09-25 04:46:44
+  If this is far off, certificate date checks will fail on a good cert.
+
+sysmodule NET        : 0x00000000
+sceNetInit           : 0x00000000
+sceNetCtlInit        : 0x00000000
+netctl state         : 0x00000000 state=3 (3 == CONNECTED)
+sysmodule HTTP       : 0x00000000
+sysmodule SSL        : 0x00000000
+sysmodule HTTPS      : 0x00000000
+sceSslInit           : 0x00000000
+sceHttpInit          : 0x00000000
+
+--- CONTROL: plain HTTP, no TLS at all
+    http://example.com/
+    autoRedirect     : 0x00000000
+    sendRequest      : 0x80436007
+    sslError         : err=0x00000000 detail=0x00000000
+
+--- RUNG 1: HTTPS, firmware default verification
+    https://bryanthaboi.github.io/gen1recomp-mod-index/data/index.json
+    autoRedirect     : 0x00000000
+    sendRequest      : 0x80431075
+    sslError         : err=0x80435061 detail=0x00000000
+
+disable date checks  : 0x00000000
+
+--- RUNG 2: HTTPS, date checks disabled
+    https://bryanthaboi.github.io/gen1recomp-mod-index/data/index.json
+    autoRedirect     : 0x00000000
+    sendRequest      : 0x80431075
+    sslError         : err=0x80435061 detail=0x00000000
+
+disable verification : 0x8043506B
+
+--- RUNG 3: HTTPS, server verification off (Pages)
+    https://bryanthaboi.github.io/gen1recomp-mod-index/data/index.json
+    autoRedirect     : 0x00000000
+    sendRequest      : 0x80431075
+    sslError         : err=0x80435061 detail=0x00000000
+
+--- RUNG 3b: HTTPS, server verification off (raw)
+    https://raw.githubusercontent.com/bryanthaboi/gen1recomp-mod-index/main/site/data/index.json
+    autoRedirect     : 0x00000000
+    sendRequest      : 0x80431075
+    sslError         : err=0x80435061 detail=0x00000000
+
+=============================
+How to read this:
+  CONTROL fails            -> not a TLS problem. Check Wi-Fi/DNS.
+  RUNG 1 succeeds          -> nothing to build. Firmware TLS is fine.
+  RUNG 2 succeeds, 1 fails -> the clock is the problem. Plan is right.
+  RUNG 3 succeeds, 2 fails -> chain validation only. Ship our own roots.
+  RUNG 3 fails             -> sceSsl cannot reach GitHub. Plan is dead;
+                              fall back to mbedtls or an HTTP mirror.

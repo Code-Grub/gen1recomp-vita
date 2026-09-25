@@ -153,6 +153,76 @@ this work. It is valuable as a de-risking step: it proves install-and-enable
 works on this console before TLS is in the picture, which separates two failure
 modes that would otherwise be diagnosed together. Hence probe step 0 below.
 
+## PROBE RESULT, 2026-09-25: firmware TLS does not reach GitHub
+
+Run on hardware. Raw report:
+`docs/superpowers/evidence/2026-09-25-g1r-net-probe-run1.txt`.
+
+**Proven:**
+
+- the stack comes up clean: NET, HTTP, SSL and HTTPS sysmodules all load,
+  `sceNetInit`, `sceNetCtlInit`, `sceSslInit` and `sceHttpInit` all return 0,
+  and netctl reports `state=3` (CONNECTED)
+- DNS and TCP to GitHub work. Both HTTPS attempts reached a TLS handshake, which
+  cannot happen without resolving the host and opening a socket
+- **the TLS handshake fails**, on `bryanthaboi.github.io` and on
+  `raw.githubusercontent.com` alike: `sceHttpSendRequest` returns
+  `0x80431075` = `SCE_HTTP_ERROR_SSL`, and `sceHttpsGetSslError` reports
+  `0x80435061` = `SCE_HTTPS_ERROR_HANDSHAKE`
+- **no certificate complaint whatsoever.** The error is `HANDSHAKE`, not
+  `SCE_HTTPS_ERROR_CERT` (`0x80435060`), and the detail bitmask is `0x00000000`,
+  so not one of `INVALID_CERT`, `CN_CHECK`, `NOT_AFTER_CHECK`,
+  `NOT_BEFORE_CHECK` or `UNKNOWN_CA` is set
+- the clock is fine: `sceRtcGetCurrentClockUtc` gives `2026-09-25 04:46:44`
+
+**Consequence: the design's central mechanism is invalidated.** Shipping our own
+CA roots with `sceHttpsLoadCert` cannot fix a handshake that fails before any
+certificate is evaluated. A stale CA store would have produced `CERT` with
+`UNKNOWN_CA` set; we got neither. The signature points at protocol and
+cipher-suite negotiation, which is exactly the risk this spec listed as its
+largest unknown: GitHub requires TLS 1.2 with modern ECDHE and AES-GCM suites,
+and this firmware's SSL predates them.
+
+The date-check relaxation is also moot, and should be dropped rather than
+carried: the clock is correct, so it would buy nothing while still weakening
+verification.
+
+**Two caveats, stated because they are not yet closed:**
+
+1. `sceHttpsDisableOption(SERVER_VERIFY | CN_CHECK | KNOWN_CA_CHECK)` was
+   **rejected** with `0x8043506B`, so rungs 3 and 3b never actually disabled
+   verification and are void as tests of it. The conclusion above does not rest
+   on them: it rests on the error being `HANDSHAKE` with an empty detail mask,
+   which is a pre-certificate failure. But "verification off would not have
+   helped" is inference, not measurement.
+2. The plain-HTTP control failed with
+   `0x80436007` = `SCE_HTTP_ERROR_RESOLVER_ENOHOST` against `example.com`, while
+   the HTTPS hosts clearly did resolve. So that one result is anomalous rather
+   than informative, and it is not evidence of a DNS problem.
+
+Neither caveat changes the recommendation, but both are cheap to close, and one
+alternative reading remains open: that the handshake failed for a fixable local
+reason such as an undersized `sceSslInit` or `sceHttpInit` pool rather than
+cipher incompatibility. See "Next probe" below.
+
+## Next probe, before committing to a fallback
+
+One more 37 KB trip, worth it because it decides whether an mbedtls integration
+is necessary or merely convenient:
+
+- disable each HTTPS flag **individually** and log which are accepted, then
+  retry with verification genuinely off. Closes caveat 1 by measurement.
+- vary the `sceSslInit` and `sceHttpInit` pool sizes upward. Rules out the
+  "undersized pool" reading of a `HANDSHAKE` failure.
+- request an endpoint that serves **older** TLS (for example
+  `tls-v1-0.badssl.com:1010` and `tls-v1-2.badssl.com:1012`). This is the
+  discriminator that matters: if an old-TLS endpoint handshakes and GitHub does
+  not, firmware `sceSsl` works and is simply too old for GitHub, which is
+  conclusive. If nothing handshakes at all, `sceHttps` is unusable here for a
+  different reason and that changes what the fallback must replace.
+- retry the plain-HTTP control against a different host, and after the HTTPS
+  attempts rather than before, closing caveat 2.
+
 ## Security posture
 
 The relevant fact, verified in the engine source: **mod zips are never
