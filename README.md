@@ -1,7 +1,17 @@
 # Gen1Recomp on PS Vita (experimental)
 
+Based on the Pokemon Gen 1 Recompilation Project by BOIS CLUB GAMES, LLC
+(https://github.com/bryanthaboi/gen1recomp)
+
 Runs the Gen1Recomp engine on isage's LÖVE 11.4 Vita port
 (https://github.com/isage/love, release `11.4-vita`). No VitaSDK needed.
+
+**This repository ships no playable artifact, and cannot.** A built VPK
+necessarily contains the engine's Launcher, which its `LICENSE.MD` Additional
+Term 2 makes proprietary and permits distributing "only in unmodified official
+releases from BOIS CLUB GAMES, LLC". So this repo is source only: build your own
+VPK from your own engine checkout. See `docs/upstream-issue-draft.md` for the
+route to an official Vita build.
 
 ## Build
 
