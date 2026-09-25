@@ -262,7 +262,90 @@ Unrelated but recorded: the resolver is partially broken on this network.
 out, while `detectportal.firefox.com` and every badssl host resolved. Not a
 blocker and not ours to fix, but do not use `example.com` as a control again.
 
-## Next probe (run 3): how narrow is the GitHub failure?
+## PROBE RESULT 3, 2026-09-25: the gap is ECDSA, and the CA store is old
+
+Raw report: `docs/superpowers/evidence/2026-09-25-g1r-net-probe-run3.txt`.
+This names the missing capability, and it **partially revives the own-roots
+plan** that result 1 appeared to kill.
+
+**The decisive rows:**
+
+| Host | Result |
+| --- | --- |
+| `ecc256.badssl.com` (P-256 ECDSA) | **HANDSHAKE fail** |
+| `ecc384.badssl.com` (P-384 ECDSA) | **HANDSHAKE fail** |
+| `rsa2048`, `rsa4096` | OK 200 |
+| `sha384`, `sha512` signatures | OK 200 |
+| `cbc`, `3des` suites | OK 200 |
+
+So this stack does RSA certificates up to 4096 bits with SHA-512 signatures and
+happily speaks old CBC and 3DES suites, but **cannot do ECDSA certificates or
+ECC key exchange at all**. GitHub Pages and `objects.githubusercontent.com`
+serve ECDSA, which is the entire explanation for the original failure. Nothing
+about cipher "modernity" in general: RSA-with-SHA512 is modern and works.
+
+**Corroboration from GitHub's own other hosts**, and this is the important part:
+
+| Host | Result |
+| --- | --- |
+| `github.io` | HANDSHAKE fail, detail `[none]` |
+| `objects.githubusercontent.com` | HANDSHAKE fail, detail `[none]` |
+| `api.github.com` | **handshake OK, cert rejected `[UNKNOWN_CA]`** |
+| `codeload.github.com` | **handshake OK, cert rejected `[UNKNOWN_CA]`** |
+| `google.com` | OK 200 |
+
+Two GitHub hosts complete the handshake and fail only on `UNKNOWN_CA`. So for
+RSA-serving hosts the blocker is exactly the stale CA store that
+`sceHttpsLoadCert` exists to fix. **Result 1's conclusion was right about
+`github.io` and wrong as a general claim**: it tested only an ECDSA host, so it
+saw no certificate complaint and I generalised from one host.
+
+Corrected statement of the constraint:
+
+- host serves **ECDSA** -> handshake fails, and no certificate work can help
+- host serves **RSA** with a CA we do not carry -> `UNKNOWN_CA`, **fixable** by
+  shipping our own roots
+- host serves **RSA** with an old, widely trusted CA -> already works today
+
+The CA store being old rather than broken is consistent across the run:
+`badssl.com` and `expired.badssl.com` pass (old CA), while `api.github.com` and
+`codeload.github.com` report `UNKNOWN_CA` (newer roots).
+
+**Two anomalies, both recorded rather than smoothed over:**
+
+1. **A defect in the probe, not the console.** `cloudflare.com` reported
+   `FAIL 0x00000000 detail=[none]`, an impossible error code. Cause is mine: in
+   the failure branch `attempt()` logs `ssl_err` from `sceHttpsGetSslError`
+   instead of the real `sceHttpSendRequest` return, so when the failure is not a
+   TLS failure the actual reason is discarded. **Cloudflare's result is
+   therefore unknown**, not a failure. Fix the probe before relying on any
+   non-TLS failure line in any run.
+2. **`expired.badssl.com` returned 200.** It should have been rejected on dates.
+   The decoder is not lying (`mismatch.badssl.com` was correctly rejected with
+   `CN_CHECK UNKNOWN_CA`), so the finding is that **this firmware does not
+   enforce certificate expiry by default**. Worth knowing before relying on its
+   verification for anything, and it makes the earlier discovery that
+   `NOT_AFTER_CHECK` can be *disabled* but apparently is not *enforced* doubly
+   moot.
+
+### What this means for the design
+
+The mirror option and the own-roots mechanism combine, and neither needs new TLS
+code:
+
+- serve the index from a host with an **RSA** certificate
+- carry that host's root with `sceHttpsLoadCert` if it is not already trusted
+
+`sceHttpsLoadCert` is back in scope, and it is *additive*, not a relaxation:
+`SERVER_VERIFY` and `KNOWN_CA_CHECK` cannot be disabled on this firmware, so
+adding a root does not weaken anything. That is a materially better position
+than the design started from.
+
+Open question before committing: whether a Cloudflare-fronted mirror can be made
+to serve RSA, since Cloudflare's universal certificates are ECDSA on the free
+tier. If not, the mirror needs a host where the certificate is ours to choose.
+
+## Superseded: next probe (run 3) as originally planned
 
 Run 2 answered its three questions and replaced them with one. All of these are
 ordinary HTTPS GETs, so run 3 is the same 37 KB VPK with a different host list:

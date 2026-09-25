@@ -1,0 +1,50 @@
+gen1recomp Vita network probe -- RUN 3
+======================================
+Run 2 proved HTTPS works here (TLS 1.2 and a real chain both fine).
+This run asks how narrow the GitHub failure is, and therefore which
+fallback to build. 'HANDSHAKE OK, cert rejected' is a PASS for the
+negotiation question: it means TLS itself completed.
+
+clock (UTC)          : 2026-09-25 05:05:17
+netctl state         : 3 (3 == CONNECTED)
+sceSslInit           : 0x00000000
+sceHttpInit          : 0x00000000
+
+=== CONTROLS (one known fail, one known pass)
+  github.io (known fail)     FAIL 0x80435061 HTTPS_ERROR_HANDSHAKE detail=[none]
+  badssl.com (known ok)      OK status=200 bytes=8192
+
+=== MAINSTREAM MODERN HOSTS -- the decisive group
+  cloudflare.com             FAIL 0x00000000  detail=[none]
+  google.com                 OK status=200 bytes=8192
+  api.github.com             HANDSHAKE OK, cert rejected [UNKNOWN_CA ]
+  objects.githubusercontent  FAIL 0x80435061 HTTPS_ERROR_HANDSHAKE detail=[none]
+  codeload.github.com        HANDSHAKE OK, cert rejected [UNKNOWN_CA ]
+
+=== CIPHER AND SIGNATURE CAPABILITY
+  ecc256 (P-256 ECDSA)       FAIL 0x80435061 HTTPS_ERROR_HANDSHAKE detail=[none]
+  ecc384 (P-384 ECDSA)       FAIL 0x80435061 HTTPS_ERROR_HANDSHAKE detail=[none]
+  rsa2048                    OK status=200 bytes=603
+  rsa4096                    OK status=200 bytes=602
+  sha384 sig                 OK status=200 bytes=498
+  sha512 sig                 OK status=200 bytes=498
+  cbc suite (old)            OK status=200 bytes=485
+  3des suite (ancient)       OK status=200 bytes=483
+
+=== DECODER SANITY (both SHOULD be cert rejections)
+  mismatch cert              HANDSHAKE OK, cert rejected [CN_CHECK UNKNOWN_CA ]
+  expired cert               OK status=200 bytes=494
+
+======================================
+How to read this:
+  cloudflare + google OK    -> SNI and modern suites are fine, the
+                               failure is GitHub-specific. Mirror the
+                               index behind a permissive host; no new
+                               TLS code needed.
+  they fail, old badssl OK  -> this stack cannot do modern suites.
+                               Transport must ship its own TLS
+                               (curl + mbedtls).
+  ecc* fail, rsa* pass      -> missing ECDHE/ECDSA. That alone
+                               explains GitHub and names the gap.
+  SANITY rows not rejected  -> the decoder is lying; distrust the
+                               detail masks in every run above.

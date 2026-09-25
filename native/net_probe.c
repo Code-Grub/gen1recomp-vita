@@ -137,15 +137,20 @@ static void attempt(const char *label, const char *url)
 
 	ret = sceHttpSendRequest(req, NULL, 0);
 	if (ret < 0) {
-		if (sceHttpsGetSslError(req, &ssl_err, &ssl_detail) >= 0) {
+		/* Always report the sendRequest error. Run 3 logged ssl_err alone here,
+		 * so a NON-TLS failure printed as 0x00000000 and its real cause was
+		 * lost (cloudflare.com, run 3). Never discard `ret` again. */
+		if (sceHttpsGetSslError(req, &ssl_err, &ssl_detail) >= 0 && ssl_err != 0) {
 			detail_bits(ssl_detail, bits, sizeof(bits));
 			if ((unsigned int)ssl_err == 0x80435060u)
-				logf_("  %-26s HANDSHAKE OK, cert rejected [%s]", label, bits);
+				logf_("  %-26s HANDSHAKE OK, cert rejected [%s] (send 0x%08X)",
+				      label, bits, ret);
 			else
-				logf_("  %-26s FAIL 0x%08X %s detail=[%s]", label,
-				      ssl_err, err_name(ssl_err), bits);
+				logf_("  %-26s FAIL send=0x%08X %s ssl=0x%08X %s detail=[%s]",
+				      label, ret, err_name(ret), ssl_err, err_name(ssl_err), bits);
 		} else {
-			logf_("  %-26s FAIL 0x%08X %s (not TLS)", label, ret, err_name(ret));
+			logf_("  %-26s FAIL send=0x%08X %s (no TLS error reported)",
+			      label, ret, err_name(ret));
 		}
 		goto done;
 	}
