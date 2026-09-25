@@ -61,12 +61,97 @@ Our eboot defines `LOVE_LINUX`, so `getOS()` returns `"Linux"`, which is
 indistinguishable from desktop Linux where the gate must stay false. A small
 engine-side change is therefore unavoidable.
 
+That change is smaller than it first appears, because **the engine already has
+a capability-probe convention for exactly this** and `haveBridge()` is the
+outlier. `src/core/Platform.lua:15` computes
+
+```lua
+local nativeHttp = love and love.system
+  and type(love.system.httpDownload) == "function"
+```
+
+with no OS allowlist at all, and feeds it into
+`canFetchRemote = (not nx and not uwp) or nativeHttp`. So the fix is to align
+`haveBridge()` with `Platform.lua` rather than to invent a new marker.
+
+Note that `NX` is absent from the allowlist too, so a Switch build that grew a
+bridge would still be refused by `HostShell`. Aligning the two helps that port
+as well, which strengthens the case for sending this upstream.
+
+### A second, independent bug: the two gates disagree
+
+On this console `getOS()` is `"Linux"`, so `nx` and `uwp` are both false and
+`Platform.canFetchRemote()` returns **true**, because the expression assumes
+"not a console" implies "desktop, therefore curl". Meanwhile
+`HostShell.canFetch()` returns **false**. The launcher consequently offers the
+mod catalog and then fails every fetch with
+`no network transport on this platform`.
+
+This is worth fixing on its own merits, independently of whether the transport
+below ever ships: today the Vita build advertises a capability it does not
+have. Fix by making `canFetchRemote` depend on an actual transport rather than
+on not being a known console.
+
 ### Why a Lua-side monkey patch cannot work
 
 Patching `HostShell` from `vita/conf.lua` would appear to work in the launcher
 and fail on every real download. `src/net/fetch_worker.lua` runs in a fresh
 `love.thread` and pulls `HostShell` in through its own `loadModule`, so a
 main-thread patch never reaches the workers that perform the fetches. Rejected.
+
+## What the other console ports do
+
+Worth knowing before committing to a TLS stack: **no gen1recomp console port has
+in-app HTTPS today.** We would be first.
+
+**Switch (NX)**, the only shipped console port (runtime
+`retronx-team/love-nx`), does not network from inside LOVE at all:
+
+- remote mod browsing is off by policy: "Remote **FIND MODS** / GitHub download
+  stays **off** on Switch" (`docs/switch-install.md:172`)
+- the LOVE self-updater is disabled (`networkValidated == false`)
+- OTA runs in a **separate native launcher NRO** built on libnx plus curl,
+  outside LOVE. It fetches the install zip, verifies SHA-256 against
+  `sha256sums.txt`, replaces both NROs, then `envSetNextLoad`s into the game
+  (`src/update/SwitchOta.lua`)
+- mods install from a **zip inbox** at `<savedir>/imports/mods/`, followed by
+  MODS then Scan again. This is engine code, not Switch-specific:
+  `MODS_INBOX_DIR = "imports/mods"` (`src/import/RomImporter.lua:451`), the
+  rescan at `:767`, and an explicit branch at `:2429` reading "NX: no
+  HostShell/desktop picker, rescan imports/mods/ inbox instead"
+
+**Xbox (UWP)** has no transport either. `Platform.lua:36`: "The UWP LOVE backend
+does not export that bridge yet, so this still resolves false on Xbox and the
+launcher still says so."
+
+**Android and iOS** are the bridge precedent this design follows: Android via a
+GameActivity JNI `HttpsURLConnection` bridge, iOS via
+`GRPickerBridge.httpDownload` over `URLSession`, both surfaced as
+`love.system.httpDownload` (`docs/updater.md:171-177`).
+
+### Alternative considered: a separate native process
+
+The Switch model (do the networking in a companion homebrew that hands off to
+the game) is proven and avoids TLS inside LOVE entirely. Rejected here for two
+reasons. First, it cannot serve the actual goal: a separate updater can fetch a
+zip, but browsing an index and installing from it is an in-game UI flow, and
+that UI reaches the network through `HostShell`. Second, its main advantage does
+not apply to us. The Switch port consumes a pinned upstream runtime it does not
+build, so patching LOVE was not an option there; we already build and patch our
+own runtime, and already carry native patches under `vita-probe/patches/`. The
+marginal cost of adding one more is low.
+
+### The inbox is a free fallback, and it is not a substitute
+
+The `imports/mods/` inbox costs nothing on this port: it is plain engine code
+with no NX hardware dependency, and the save directory is already the writable
+root. It gives mod installation with no C written, and it is what the shipped
+console port does.
+
+It does not give index browsing, which is the goal here, so it does not replace
+this work. It is valuable as a de-risking step: it proves install-and-enable
+works on this console before TLS is in the picture, which separates two failure
+modes that would otherwise be diagnosed together. Hence probe step 0 below.
 
 ## Security posture
 
@@ -151,17 +236,23 @@ engine already surfaces it as a failed fetch.
 
 ### 2. The engine gate
 
-Smallest possible change to `src/core/HostShell.lua`: alongside the existing OS
-allowlist, accept an explicit capability marker exported by the runtime. No
-other platform's behaviour changes, and `getOS()` keeps returning `"Linux"`, so
-`Performance.detect()` continues to select the `low` tier and any other
-Linux-conditioned code is untouched.
+Two small changes to engine Lua, both narrowing gates to the capability rather
+than to a platform name:
 
-This is a candidate to send upstream. The `#876` comment shows the maintainers
-already wanted a console with no curl to reach the bridge; a marker is the
-mechanism that was missing.
+- `src/core/HostShell.lua`, `haveBridge()` and `haveRequestBridge()`: accept the
+  transport when the function exists, matching what `Platform.lua:15` already
+  does, instead of requiring an OS-name match. `getOS()` keeps returning
+  `"Linux"`, so `Performance.detect()` continues to select the `low` tier and
+  every other Linux-conditioned path is untouched.
+- `src/core/Platform.lua`, `canFetchRemote`: stop inferring a transport from not
+  being a known console, so the launcher cannot advertise a catalog it cannot
+  reach. See "the two gates disagree" above.
 
-The change ships the same way the `\u{}` rewrite does, through
+Both are candidates to send upstream. The `#876` comment shows the maintainers
+already wanted a curl-less console to reach the bridge, and the second is a bug
+on any platform that is neither desktop nor a recognised console.
+
+The changes ship the same way the `\u{}` rewrite does, through
 `build_game_vpk.py`, so the engine checkout at `C:/g2dev` stays pristine.
 
 ### 3. Packaging
@@ -209,6 +300,13 @@ Vita3K cannot run this runtime at all (its GL stack fails module start), so
 every check below is on hardware, a PCH-1000 over VitaShell FTP.
 
 Ordered so that the cheapest disqualifying result comes first:
+
+0. **The inbox, no build required.** FTP a small non-voxel mod zip into
+   `<savedir>/imports/mods/`, then MODS and Scan again in the launcher. Costs
+   one FTP transfer and no code. Proves install-and-enable works on this console
+   before any transport exists, so a later network failure cannot be confused
+   with a broken install path. If this fails, fix it first: every remote install
+   ends in the same `installZip` call.
 
 1. **Threads.** A standalone probe `.love` that starts a `love.thread` and
    reports back. If this fails, stop; `Fetch` cannot work.
