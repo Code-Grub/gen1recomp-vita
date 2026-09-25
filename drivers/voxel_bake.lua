@@ -49,7 +49,8 @@ end
 -- is interrupted is worthless, so every line is written and flushed here too.
 -- Drivers are loaded with plain loadfile(), not sandboxed mod code, so io is
 -- available.
-local logFile = io.open(os.getenv("BAKE_LOG") or "C:/Users/camwr/Desktop/Gen1Recomp/vita-probe/build/bake-progress.txt", "w")
+-- Relative to the engine root the driver runs from; override with BAKE_LOG.
+local logFile = io.open(os.getenv("BAKE_LOG") or "bake-progress.txt", "w")
 
 local function say(fmt, ...)
   local text = select("#", ...) > 0 and string.format(fmt, ...) or fmt

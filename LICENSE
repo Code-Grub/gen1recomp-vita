@@ -1,0 +1,39 @@
+MIT License
+
+Copyright (c) 2026 Code-Grub
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+---
+
+This license covers the port's own code: the build and packaging scripts, the
+drivers, the patches under `patches/`, and the documentation.
+
+It does NOT cover the third-party components a built VPK bundles, each of which
+keeps its own terms:
+
+- the Gen1Recomp engine (MIT), packed into `game.love`
+- LOVE 11.x (zlib), built from the `love-vita` tree with the patches here
+- LuaJIT (MIT)
+- PowerVR `PVR_PSP2` GPU modules and `libGL.suprx` from `gl4es4vita`, which the
+  build fetches rather than vendoring
+
+No ROM or ROM-derived data is included in this repository or in a built VPK.
+The player supplies their own.
