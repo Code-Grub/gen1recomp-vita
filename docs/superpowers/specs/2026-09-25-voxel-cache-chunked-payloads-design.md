@@ -28,19 +28,13 @@ tuning cannot help, and raising the heap only moved the wall (47 MB peak at a
 
 ### Exactly what holds the memory
 
-`MeshCache.savePackedChunks` (`lib/MeshCache.lua:960`) is the whole story:
-
-```lua
-local raw, err = GeometryStream.toPayload(stream)  -- concatenates EVERY chunk
-local bytes = packPayload(fp, raw)                 -- header + lz4/zstd: another copy
-return writePayload(key, mkey, bytes, fp)          -- one whole-value writeBytes
-```
-
-So at the moment of writing a slot, three full representations coexist: the
-stream's retained chunk strings, the concatenated `raw`, and the compressed
-`bytes`. `saveTerrain` and `saveWater` follow the same shape via
-`encodeIndexed`. For the largest slots that is comfortably the 110 MB we
-measured.
+`MeshCache.savePackedChunks` (`lib/MeshCache.lua:960`) is the whole story. It
+serialises the finished stream into one string, compresses that into a second
+string, and hands the result to a single whole-value write. So at the moment of
+writing a slot, **three full representations coexist**: the stream's retained
+chunks, the concatenated copy, and the compressed copy. The terrain and water
+save paths have the same shape. For the largest slots that is comfortably the
+110 MB we measured.
 
 **The read path has the same defect**, which we had not accounted for:
 `readPayload` (`lib/MeshCache.lua:620`) does `readBytes(key)` for the ENTIRE

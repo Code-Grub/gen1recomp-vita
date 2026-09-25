@@ -24,11 +24,8 @@ Today every attempt fails with `no network transport on this platform`.
 
 ## Background: why there is no transport
 
-Everything funnels through one gate:
-
-```
-HostShell.canFetch() = haveCurl() or haveBridge()
-```
+Everything funnels through one gate: `HostShell.canFetch()`, which is true when
+either the curl transport or the native bridge is available.
 
 `haveCurl()` is false on the Vita: the desktop transport is `io.popen` plus a
 `curl` binary (`src/core/HostShell.lua:572`), and the console has neither
@@ -63,14 +60,9 @@ engine-side change is therefore unavoidable.
 
 That change is smaller than it first appears, because **the engine already has
 a capability-probe convention for exactly this** and `haveBridge()` is the
-outlier. `src/core/Platform.lua:15` computes
-
-```lua
-local nativeHttp = love and love.system
-  and type(love.system.httpDownload) == "function"
-```
-
-with no OS allowlist at all, and feeds it into
+outlier. `src/core/Platform.lua:15` decides the same question by simply testing
+whether `love.system.httpDownload` exists, with no OS allowlist at all, and
+feeds that into
 `canFetchRemote = (not nx and not uwp) or nativeHttp`. So the fix is to align
 `haveBridge()` with `Platform.lua` rather than to invent a new marker.
 
