@@ -308,18 +308,38 @@ Ordered so that the cheapest disqualifying result comes first:
    with a broken install path. If this fails, fix it first: every remote install
    ends in the same `installZip` call.
 
-1. **Threads.** A standalone probe `.love` that starts a `love.thread` and
-   reports back. If this fails, stop; `Fetch` cannot work.
-2. **Connectivity and TLS.** A probe VPK performing one `httpDownload` of the
-   real index feed
-   (`https://bryanthaboi.github.io/gen1recomp-mod-index/data/index.json`, or
-   the `Code-Grub` fork's Pages URL if the console is pointed at that instead)
-   and writing status, byte count and any `sceHttpsGetSslError` detail from C.
-   Lua file writes do not work inside the running game on this port, only in
-   standalone probes, so the report comes from C.
-3. **Clock skew.** Read and report the console's date in the same probe, to
-   confirm whether the date-check relaxation is actually being exercised.
+1. **Threads: already answered, no trip needed.** `patches/README.md` records
+   that `modules/thread/LuaThread.cpp` needed `jit.off()` in every worker state,
+   "measured by elimination: one state compiling repeatedly is fine, three more
+   running interpreted alongside it are fine, but the moment those states compile
+   too the process dies." Three concurrent worker Lua states on hardware means
+   `love.thread` works on this port. Note the consequence for this design: the
+   fetch workers will run interpreted, which is fine because they block on
+   `sceHttp` rather than on Lua.
+2. **Connectivity and TLS. Built: `native/net_probe.c`,
+   `native/build_net_probe.sh`, output `build/g1r-net-probe.vpk` (37 KB).**
+   Standalone homebrew rather than a LOVE build, because the question needs no
+   Lua runtime and a 37 KB VPK is a far cheaper trip than a 32 MB game build.
+   It writes `ux0:data/g1r-net.txt` and climbs a ladder that separates the two
+   failure modes leading to opposite decisions: a plain-HTTP control, then HTTPS
+   with firmware defaults, then with only the date checks disabled, then with
+   server verification off, then the same against `raw.githubusercontent.com`.
+   Passing only the last rung means the handshake is fine and just chain
+   validation failed, so shipping our own roots works. Failing the last rung
+   means `sceSsl` cannot reach GitHub and this design is dead. The report ends
+   with a written key for reading exactly that.
+
+   The feed probed is
+   `https://bryanthaboi.github.io/gen1recomp-mod-index/data/index.json` plus the
+   `raw.githubusercontent.com` equivalent. Point it at the `Code-Grub` fork's
+   Pages URL instead by editing `URL_PAGES` and rebuilding. The report is
+   written from C because Lua file writes do not work inside the running game on
+   this port, only in standalone probes.
+
+3. **Clock skew.** Folded into step 2: the probe reports the console's UTC clock
+   before any request, so a date-check failure can be attributed immediately.
 4. **Concurrency.** Three simultaneous downloads, matching the worker pool.
+   Deferred until the transport exists; it cannot be probed standalone.
 5. **End to end in game.** Add the index in the launcher, browse it, install one
    small mod, confirm it appears in the mod list after a relaunch. Use a small
    non-voxel mod for this, not a voxel mod: it separates "install works" from
@@ -334,7 +354,10 @@ Keep the existing rule of one change per hardware test.
   certificate work helps, and the fallback is a different stack (vdpm `curl`
   plus `mbedtls`, neither currently installed in this VitaSDK) or an HTTP
   mirror. Probe step 2 settles it, and it is the reason step 2 comes early.
-- **Threads on this runtime.** Unverified. Probe step 1.
+- ~~Threads on this runtime.~~ Resolved before probing: three concurrent worker
+  Lua states are already measured on hardware (`patches/README.md`, the
+  `LuaThread.cpp` entry). The fetch pool will run interpreted, which is fine for
+  I/O-bound work.
 - **Index size.** 157 mods today with no conditional GET, so every refresh is a
   full download. Measure it; if it is large, revisit.
 - **Root set drift.** Shipping roots means a maintenance obligation. Record
