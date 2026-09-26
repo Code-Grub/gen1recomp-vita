@@ -1,6 +1,7 @@
 # Draft issue for bryanthaboi/gen1recomp
 
-Not yet posted. Title and body below.
+Posted as https://github.com/bryanthaboi/gen1recomp/issues/2490 on 2026-09-25.
+Kept here as the record of what was sent.
 
 ---
 
